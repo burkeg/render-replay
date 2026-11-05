@@ -285,7 +285,7 @@ public class RenderReplayPlugin extends Plugin
 			if (DrawRecorder.isPaused(recording))
 			{
 				DrawRecorder.resume(recording);
-				publish("Playing (world is uninteractive)");
+				publish("Playing");
 			}
 			else if (DrawRecorder.pause(recording))
 			{
@@ -404,7 +404,7 @@ public class RenderReplayPlugin extends Plugin
 		playbackKeys.setActive(true);
 		DrawRecorder.startPlayback(recording, () -> clientThread.invokeLater(this::finishPlayback), -1, offsetMs);
 		client.setDrawCallbacks(recording);
-		publish("Playing (world is uninteractive)");
+		publish("Playing");
 	}
 
 	private void stopPlayback()
@@ -877,8 +877,8 @@ public class RenderReplayPlugin extends Plugin
 			: areaDiffers && DrawRecorder.canSwapScenes(rec) ? "Playing in another map area: the recorded scene is reloaded, yours is restored afterwards."
 			: areaDiffers ? "Playing. You are in a different area than the recording: terrain shown is your CURRENT area (recorded objects only)."
 			: recorded > 0 && Math.abs(recorded - live) > recorded * 0.02 ? "Playing. Zoom differs: recorded " + recorded + ", yours " + live + ". Match your zoom for an exact picture."
-			: DrawRecorder.isPaused(rec) ? "Paused at tick " + DrawRecorder.replayTick(rec) + " (world is uninteractive)"
-			: "Playing (world is uninteractive)";
+			: DrawRecorder.isPaused(rec) ? "Paused at tick " + DrawRecorder.replayTick(rec)
+			: "Playing";
 		if (!settingsWarning.isEmpty())
 		{
 			m = settingsWarning + "<br>" + m;

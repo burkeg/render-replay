@@ -86,7 +86,7 @@ public class NoSideEffectsTest
 	/**
 	 * RuneLite plugin hub rules (wiki "Rejected or Rolled Back Features" > "Forbidden language features", example-plugin
 	 * AGENTS.md): no reflection, JNI/JNA, Unsafe, external processes, classloading or runtime code generation (dynamic
-	 * proxies included), no Java (de)serialization. Ticket. Comments are ignored; code is what counts.
+	 * proxies included), no Java (de)serialization. Comments are ignored; code is what counts.
 	 */
 	@Test
 	public void noReflectionOrRuntimeCodeGeneration() throws IOException
