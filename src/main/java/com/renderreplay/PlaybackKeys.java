@@ -25,7 +25,7 @@ final class PlaybackKeys implements KeyListener
 	private boolean spaceDown;  // ignore key auto-repeat for Space
 	private boolean leftDown;
 	private boolean rightDown;
-	private long lastLeftMs;
+	long lastLeftMs;
 
 	PlaybackKeys(Runnable onToggle, StepAction onStep)
 	{

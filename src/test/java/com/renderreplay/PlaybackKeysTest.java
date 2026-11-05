@@ -104,7 +104,7 @@ public class PlaybackKeysTest
 			b.keyPressed(press(KeyEvent.VK_LEFT));                // a burst of auto-repeats within the throttle window
 		}
 		assertEquals("only the first press acts inside the window", java.util.Arrays.asList("step-1"), log);
-		Thread.sleep(PlaybackKeys.LEFT_REPEAT_MS + 40);
+		b.lastLeftMs -= PlaybackKeys.LEFT_REPEAT_MS + 40;         // as if the throttle window had passed
 		b.keyPressed(press(KeyEvent.VK_LEFT));                    // still held: one more rewind step
 		assertEquals(java.util.Arrays.asList("step-1", "step-1r"), log);
 		b.keyReleased(release(KeyEvent.VK_LEFT));

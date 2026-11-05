@@ -1190,19 +1190,17 @@ final class DrawRecorder implements DrawCallbacks
 	{
 		liveLoadPending = true;
 		// A swap of ours already running on the client thread finishes before this load reaches the renderer: switchScene
-		// checks liveLoadPending after raising inSwitch, and this thread checks inSwitch after raising liveLoadPending.
-		long end = System.currentTimeMillis() + loadGuardTimeoutMs;
-		while (inSwitch && switchThread != Thread.currentThread() && System.currentTimeMillis() < end)
+		// checks liveLoadPending after taking switchLock, and this thread takes the lock after raising liveLoadPending.
+		try
 		{
-			try
+			if (switchLock.tryLock(loadGuardTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS))
 			{
-				Thread.sleep(1);
+				switchLock.unlock();
 			}
-			catch (InterruptedException e)
-			{
-				Thread.currentThread().interrupt();
-				break;
-			}
+		}
+		catch (InterruptedException e)
+		{
+			Thread.currentThread().interrupt();
 		}
 		if (!playing || probe == null || sceneInUse == null || sceneInUse == clientScene)
 		{
@@ -1308,8 +1306,8 @@ final class DrawRecorder implements DrawCallbacks
 		switchScene(f.scene);
 	}
 
-	private volatile boolean inSwitch;
-	private volatile Thread switchThread;
+	// Held while a swap of ours runs.
+	private final java.util.concurrent.locks.ReentrantLock switchLock = new java.util.concurrent.locks.ReentrantLock();
 
 	private void switchScene(Scene target)
 	{
@@ -1319,8 +1317,7 @@ final class DrawRecorder implements DrawCallbacks
 	/** forLoadGuard: the map-loading thread is waiting for exactly this swap, so a pending load does not stop it. */
 	private void switchScene(Scene target, boolean forLoadGuard)
 	{
-		switchThread = Thread.currentThread();
-		inSwitch = true;
+		switchLock.lock();
 		try
 		{
 			if (liveLoadPending && !forLoadGuard)
@@ -1331,7 +1328,7 @@ final class DrawRecorder implements DrawCallbacks
 		}
 		finally
 		{
-			inSwitch = false;
+			switchLock.unlock();
 		}
 	}
 
