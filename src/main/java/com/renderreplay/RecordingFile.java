@@ -20,7 +20,7 @@ import java.util.zip.ZipInputStream;
 /** A parsed .rrec recording (zip): manifest, per-frame table, draw rows and model geometry. Pure data, no client access. */
 final class RecordingFile
 {
-	static final int FRAMES_MAGIC = 0x52523202; // "RR" + format 2
+	static final int FRAMES_MAGIC = 0x52523203; // "RR" + format 3
 
 	static final class Frame
 	{
@@ -63,7 +63,7 @@ final class RecordingFile
 		DataInputStream d = new DataInputStream(new ByteArrayInputStream(fb));
 		if (d.readInt() != FRAMES_MAGIC)
 		{
-			throw new IOException("recording was made by an older Render Replay (no data to play it from a file)");
+			throw new IOException("recording was made by another version of Render Replay");
 		}
 		int n = d.readInt();
 		for (int i = 0; i < n; i++)

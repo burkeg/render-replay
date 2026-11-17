@@ -1,5 +1,8 @@
 package com.renderreplay;
 
+import com.google.common.collect.MapMaker;
+import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.gson.Gson;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -8,13 +11,14 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.UnaryOperator;
+import java.util.function.BiFunction;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.GameObject;
 import net.runelite.api.Model;
@@ -44,9 +48,10 @@ final class DrawRecorder implements DrawCallbacks
 		"drawDynamic", "drawTemp", "drawPass", "drawZoneOpaque", "drawZoneAlpha", "draw"));
 	private static final int RETAIN_FRAMES = 60_000;
 	// Every Nth frame's 2D layer is stored whole, so dropping old frames never breaks the delta chain.
-	private static final int UI_KEYFRAME_EVERY = 30;
-	// Retained frames are kept while their estimated size fits this budget, but never fewer than minFrames.
-	static volatile long budgetBytes = Math.min(Runtime.getRuntime().maxMemory() / 4, 1_500_000_000L);
+	private static final int UI_KEYFRAME_EVERY = 60;
+	// Retained frames are kept while their estimated size fits this budget, but never fewer than minFrames. A quarter
+	// of the heap the RuneLite launcher gives the client by default.
+	static volatile long budgetBytes = 192L << 20;
 	static volatile int minFrames = 300;
 
 	private final Gson gson;
@@ -54,8 +59,12 @@ final class DrawRecorder implements DrawCallbacks
 	private final BufferedWriter out;
 	private final BufferedWriter modelsOut;
 	// Makes a frozen copy of a live model: the client rewrites and reuses its Model objects. May be null.
-	private final UnaryOperator<Model> snapshotter;
-	private final Map<Integer, Model> snapshots = new HashMap<>();
+	private final BiFunction<Model, ArrayPool, Model> snapshotter;
+	// Geometry id -> its copy, for as long as a retained frame draws it.
+	private final Map<Integer, Model> snapshots = new MapMaker().weakValues().makeMap();
+	private final ArrayPool arrays = new ArrayPool();
+	// Guarded by lock.
+	private final CallPool callPool = new CallPool();
 	// Content hash -> id: each distinct geometry is written once to modelsOut and referenced by id.
 	private final Map<Long, Integer> geometryIds = new HashMap<>();
 	// drawDynamic's worker index is replayed round-robin over the number of workers seen while recording.
@@ -107,12 +116,13 @@ final class DrawRecorder implements DrawCallbacks
 		final boolean keyframe;
 		final int scale;
 		final float playerX, playerZ; // NaN when unknown
-		final long bytes;             // rough retained size
+		final long bytes;             // estimated size of what this frame added to the recording
 		final int tick;
 		final int cycle;              // client game cycle when recorded, or -1
 		final Scene scene;            // the scene this frame's world calls were issued for, or null
 
-		RawFrame(long wallMs, List<Object[]> calls, byte[] uiDelta, boolean keyframe, int scale, float[] player, int tick, int cycle)
+		/** added: estimated bytes of the calls and model copies this frame does not share with earlier frames. */
+		RawFrame(long wallMs, List<Object[]> calls, long added, byte[] uiDelta, boolean keyframe, int scale, float[] player, int tick, int cycle)
 		{
 			Scene sc = null;
 			for (Object[] c : calls)
@@ -140,7 +150,7 @@ final class DrawRecorder implements DrawCallbacks
 			this.playerZ = player == null ? Float.NaN : player[1];
 			this.tick = tick;
 			this.cycle = cycle;
-			this.bytes = calls.size() * 160L + (uiDelta == null ? 0 : uiDelta.length) + 512;
+			this.bytes = 128 + 4L * calls.size() + added + (uiDelta == null ? 0 : uiDelta.length);
 		}
 	}
 
@@ -156,7 +166,7 @@ final class DrawRecorder implements DrawCallbacks
 	// While >= 0, playback runs in real time and freezes on this frame when it reaches it (a tick step).
 	private volatile int pauseAtIdx = -1;
 
-	private List<Object[]> rawCalls = new ArrayList<>();
+	private ArrayList<Object[]> rawCalls = new ArrayList<>();
 	private final List<RawFrame> retained = new ArrayList<>();
 	private long retainedBytes;
 	private volatile boolean playing;
@@ -192,7 +202,7 @@ final class DrawRecorder implements DrawCallbacks
 		return (d <= TEXTURE_PERIOD / 2 ? d : d - TEXTURE_PERIOD) * (long) CYCLE_MS;
 	}
 
-	private DrawRecorder(DrawCallbacks delegate, Gson gson, BufferedWriter out, BufferedWriter modelsOut, UnaryOperator<Model> snapshotter, Probe probe)
+	private DrawRecorder(DrawCallbacks delegate, Gson gson, BufferedWriter out, BufferedWriter modelsOut, BiFunction<Model, ArrayPool, Model> snapshotter, Probe probe)
 	{
 		this.delegate = delegate;
 		this.gson = gson;
@@ -202,7 +212,7 @@ final class DrawRecorder implements DrawCallbacks
 		this.probe = probe;
 	}
 
-	static DrawCallbacks wrap(DrawCallbacks delegate, Gson gson, BufferedWriter out, BufferedWriter modelsOut, UnaryOperator<Model> snapshotter, Probe probe)
+	static DrawCallbacks wrap(DrawCallbacks delegate, Gson gson, BufferedWriter out, BufferedWriter modelsOut, BiFunction<Model, ArrayPool, Model> snapshotter, Probe probe)
 	{
 		return new DrawRecorder(delegate, gson, out, modelsOut, snapshotter, probe);
 	}
@@ -221,7 +231,7 @@ final class DrawRecorder implements DrawCallbacks
 		for (int k = 0; k < rf.frames.size(); k++)
 		{
 			RecordingFile.Frame f = rf.frames.get(k);
-			List<Object[]> calls = new ArrayList<>();
+			ArrayList<Object[]> calls = new ArrayList<>();
 			for (com.google.gson.JsonElement e : rf.drawFrames.get(off + k))
 			{
 				com.google.gson.JsonArray row = e.getAsJsonArray();
@@ -234,20 +244,22 @@ final class DrawRecorder implements DrawCallbacks
 				Object[] args = new Object[pt.length];
 				for (int i = 0; i < pt.length; i++)
 				{
-					args[i] = importArg(row.get(i + 1), pt[i], rf, cache);
+					args[i] = importArg(row.get(i + 1), pt[i], rf, cache, r.arrays);
 				}
-				calls.add(new Object[]{m, args});
+				calls.add(r.callPool.share(m, args));
 			}
+			calls.trimToSize();
 			float[] player = Float.isNaN(f.playerX) ? null : new float[]{f.playerX, f.playerZ};
 			synchronized (r.lock)
 			{
-				r.retained.add(new RawFrame(f.wallMs, calls, f.uiDelta, f.keyframe, f.scale, player, f.tick, -1));
+				r.retained.add(new RawFrame(f.wallMs, calls, r.callPool.endFrame() + r.arrays.takeAdded(), f.uiDelta, f.keyframe,
+					f.scale, player, f.tick, -1));
 			}
 		}
 		return r;
 	}
 
-	private static Object importArg(com.google.gson.JsonElement cell, Class<?> type, RecordingFile rf, Map<String, Object> cache)
+	private static Object importArg(com.google.gson.JsonElement cell, Class<?> type, RecordingFile rf, Map<String, Object> cache, ArrayPool arrays)
 	{
 		if (cell == null || cell.isJsonNull())
 		{
@@ -290,7 +302,7 @@ final class DrawRecorder implements DrawCallbacks
 			else if (o.has("model"))
 			{
 				com.google.gson.JsonObject b = rf.models.get(o.get("model").getAsInt());
-				made = b == null ? null : FileReplay.model(b);
+				made = b == null ? null : FileReplay.model(b, arrays);
 			}
 			else if (o.has("tilemodel"))
 			{
@@ -577,7 +589,7 @@ final class DrawRecorder implements DrawCallbacks
 		{
 			if (WORLD_CALLS.contains(m.methodName) && !m.isFrameEnd())
 			{
-				rawCalls.add(new Object[]{m, frozen(m, args, row)});
+				rawCalls.add(callPool.share(m, frozen(m, args, row)));
 			}
 			if (calls.size() < MAX_CALLS_PER_FRAME)
 			{
@@ -596,8 +608,10 @@ final class DrawRecorder implements DrawCallbacks
 		long drop;
 		synchronized (lock)
 		{
-			retained.add(new RawFrame(System.currentTimeMillis(), rawCalls, ui, key, probe == null ? 0 : probe.scale(),
-				probe == null ? null : probe.playerLocal(), probe == null ? 0 : probe.tick(), probe == null ? -1 : probe.gameCycle()));
+			rawCalls.trimToSize();
+			retained.add(new RawFrame(System.currentTimeMillis(), rawCalls, callPool.endFrame() + arrays.takeAdded(), ui, key,
+				probe == null ? 0 : probe.scale(), probe == null ? null : probe.playerLocal(), probe == null ? 0 : probe.tick(),
+				probe == null ? -1 : probe.gameCycle()));
 			retainedBytes += retained.get(retained.size() - 1).bytes;
 			// Drop the oldest frames while over budget, but only down to a keyframe so the 2D-layer chain stays decodable.
 			while ((retainedBytes > budgetBytes || retained.size() > RETAIN_FRAMES) && retained.size() > minFrames
@@ -609,7 +623,7 @@ final class DrawRecorder implements DrawCallbacks
 			{
 				retainedBytes -= retained.remove(0).bytes;
 			}
-			rawCalls = new ArrayList<>();
+			rawCalls = new ArrayList<>(rawCalls.size());
 			projCache.clear();
 			batch = calls;
 			calls = new ArrayList<>();
@@ -648,7 +662,7 @@ final class DrawRecorder implements DrawCallbacks
 
 	// Bounded queue: when the writer falls behind, the render thread writes the frame itself.
 	private final java.util.concurrent.ExecutorService writer = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0L,
-		java.util.concurrent.TimeUnit.MILLISECONDS, new java.util.concurrent.LinkedBlockingQueue<>(1500), r ->
+		TimeUnit.MILLISECONDS, new java.util.concurrent.LinkedBlockingQueue<>(1500), r ->
 		{
 			Thread t = new Thread(r, "render-replay-writer");
 			t.setDaemon(true);
@@ -659,16 +673,7 @@ final class DrawRecorder implements DrawCallbacks
 	/** Waits until every frame handed to the writer thread has been written and stops the thread. Call before closing the files. */
 	static void drainWrites(DrawCallbacks cb)
 	{
-		DrawRecorder r = handler(cb);
-		r.writer.shutdown();
-		try
-		{
-			r.writer.awaitTermination(30, java.util.concurrent.TimeUnit.SECONDS);
-		}
-		catch (InterruptedException e)
-		{
-			Thread.currentThread().interrupt();
-		}
+		MoreExecutors.shutdownAndAwaitTermination(handler(cb).writer, 30, TimeUnit.SECONDS);
 	}
 
 	/** Compact description of an argument for the draws file. Never calls anything that could compute a model. */
@@ -818,8 +823,8 @@ final class DrawRecorder implements DrawCallbacks
 				body.put("t1", m.getTexIndices1());
 				body.put("t2", m.getTexIndices2());
 				body.put("t3", m.getTexIndices3());
-				body.put("rad", m.getRadius());
-				body.put("dia", m.getDiameter());
+				// Radius and diameter are left out: the client fills them in lazily, so until then they hold whatever an
+				// earlier model left there, and equal geometry would count as new. Stand-ins compute their own.
 			}
 			catch (RuntimeException e)
 			{
@@ -856,21 +861,6 @@ final class DrawRecorder implements DrawCallbacks
 			}
 			id = nextId.getAndIncrement();
 			geometryIds.put(h, id);
-		}
-		if (g instanceof Model && snapshotter != null)
-		{
-			try
-			{
-				Model copy = snapshotter.apply((Model) g);
-				synchronized (snapshots)
-				{
-					snapshots.put(id, copy);
-				}
-			}
-			catch (RuntimeException e)
-			{
-				// no snapshot: playback falls back to the live object for this model
-			}
 		}
 		body.put("id", id);
 		body.put("kind", kind);
@@ -1191,17 +1181,8 @@ final class DrawRecorder implements DrawCallbacks
 		liveLoadPending = true;
 		// A swap of ours already running on the client thread finishes before this load reaches the renderer: switchScene
 		// checks liveLoadPending after taking switchLock, and this thread takes the lock after raising liveLoadPending.
-		try
-		{
-			if (switchLock.tryLock(loadGuardTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS))
-			{
-				switchLock.unlock();
-			}
-		}
-		catch (InterruptedException e)
-		{
-			Thread.currentThread().interrupt();
-		}
+		switchLock.lock();
+		switchLock.unlock();
 		if (!playing || probe == null || sceneInUse == null || sceneInUse == clientScene)
 		{
 			return;
@@ -1223,25 +1204,18 @@ final class DrawRecorder implements DrawCallbacks
 				done.countDown();
 			}
 		});
-		try
+		if (!Uninterruptibles.awaitUninterruptibly(done, loadGuardTimeoutMs, TimeUnit.MILLISECONDS))
 		{
-			if (!done.await(loadGuardTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS))
+			if (phase.compareAndSet(0, 2))
 			{
-				if (phase.compareAndSet(0, 2))
-				{
-					// the client thread never got to it: proceed, with our swaps off
-					sceneSwapFailed = true;
-					endRequested = true;
-				}
-				else
-				{
-					done.await(); // it is running right now: let it finish before the load continues
-				}
+				// the client thread never got to it: proceed, with our swaps off
+				sceneSwapFailed = true;
+				endRequested = true;
 			}
-		}
-		catch (InterruptedException e)
-		{
-			Thread.currentThread().interrupt();
+			else
+			{
+				Uninterruptibles.awaitUninterruptibly(done); // it is running right now: let it finish before the load continues
+			}
 		}
 	}
 
@@ -1742,7 +1716,17 @@ final class DrawRecorder implements DrawCallbacks
 	/** Ends capture: from now on this wrapper only forwards and, when asked, replays. */
 	static void stopCapture(DrawCallbacks cb)
 	{
-		handler(cb).capturing = false;
+		DrawRecorder r = handler(cb);
+		r.capturing = false;
+		synchronized (r.lock)
+		{
+			long ui = 0;
+			for (RawFrame f : r.retained)
+			{
+				ui += f.uiDelta == null ? 0 : f.uiDelta.length;
+			}
+			log.debug("kept {} frames in about {} KB, {} KB of that the 2D layer", r.retained.size(), r.retainedBytes >> 10, ui >> 10);
+		}
 	}
 
 	/** Estimated bytes held by retained frames. */
@@ -1816,8 +1800,31 @@ final class DrawRecorder implements DrawCallbacks
 	// FloatProjection -> its frozen copy for the frame being recorded; guarded by lock, cleared at every frame end.
 	private final Map<Object, Object> projCache = new IdentityHashMap<>();
 
-	/** Copy of the call's args with everything the client rewrites after the frame replaced by a frozen copy. */
+	/**
+	 * The frozen copy of the geometry with this id: the one an earlier call made if a retained frame still draws it,
+	 * else a new copy of the live model, which holds that geometry now. Null when no copy can be made; playback then
+	 * falls back to the live object.
+	 */
+	private Model snapshot(Integer id, Model live)
+	{
+		Model snap = snapshots.get(id);
+		if (snap == null && snapshotter != null)
+		{
+			try
+			{
+				snap = snapshotter.apply(live, arrays);
+				arrays.added(160);
+				snapshots.put(id, snap);
+			}
+			catch (RuntimeException e)
+			{
+				return null;
+			}
+		}
+		return snap;
+	}
 
+	/** Copy of the call's args with everything the client rewrites after the frame replaced by a frozen copy. */
 	private Object[] frozen(Call m, Object[] args, Object[] row)
 	{
 		if (args == null)
@@ -1830,16 +1837,16 @@ final class DrawRecorder implements DrawCallbacks
 			if (out[i] instanceof Model && row[i + 1] instanceof Map)
 			{
 				Object id = ((Map<?, ?>) row[i + 1]).get("model");
-				Model snap;
-				synchronized (snapshots)
-				{
-					snap = id instanceof Integer ? snapshots.get(id) : null;
-				}
+				Model snap = id instanceof Integer ? snapshot((Integer) id, (Model) out[i]) : null;
 				if (snap != null)
 				{
 					out[i] = snap;
 				}
 			}
+		}
+		if (m == Call.DRAW_DYNAMIC_WORKER && out[0] instanceof Integer && (Integer) out[0] > 0)
+		{
+			out[0] = 0; // replay deals the worker index itself (dynIndex), so equal calls of different workers can be shared
 		}
 		for (int i = 0; i < out.length; i++)
 		{
@@ -1896,20 +1903,19 @@ final class DrawRecorder implements DrawCallbacks
 		{
 			return;
 		}
-		if (idx < uiAppliedIdx)
+		// Decode from the nearest keyframe, or on from the last applied frame when that is already past it.
+		int from = idx;
+		while (from > 0 && !frames.get(from).keyframe)
 		{
-			uiAppliedIdx = -1;
-			uiBuf = null;
+			from--;
 		}
-			// Decode forward from the last applied frame, or from the nearest keyframe when starting cold.
-		int from = uiAppliedIdx + 1;
-		if (uiAppliedIdx < 0)
+		if (uiAppliedIdx >= from && uiAppliedIdx <= idx)
 		{
-			from = idx;
-			while (from > 0 && !frames.get(from).keyframe)
-			{
-				from--;
-			}
+			from = uiAppliedIdx + 1;
+		}
+		else
+		{
+			uiBuf = null;
 		}
 		for (int i = from; i <= idx; i++)
 		{

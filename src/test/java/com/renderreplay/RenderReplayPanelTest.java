@@ -5,13 +5,9 @@ import static org.junit.Assert.assertTrue;
 
 import java.awt.Component;
 import java.awt.Container;
-import java.awt.Graphics2D;
 import java.awt.Rectangle;
-import java.awt.image.BufferedImage;
-import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
-import javax.imageio.ImageIO;
 import javax.swing.JButton;
 import javax.swing.SwingUtilities;
 import org.junit.BeforeClass;
@@ -124,14 +120,6 @@ public class RenderReplayPanelTest
 				assertTrue("button '" + b.getText() + "' is " + b.getWidth() + "px wide but needs " + need + " (would be truncated)", b.getWidth() >= need);
 			}
 		}
-		BufferedImage img = new BufferedImage(225, 300, BufferedImage.TYPE_INT_RGB);
-		Graphics2D g = img.createGraphics();
-		g.setColor(new java.awt.Color(0x282828));
-		g.fillRect(0, 0, 225, 300);
-		SwingUtilities.invokeAndWait(() -> p.paint(g));
-		g.dispose();
-		new File("build").mkdirs();
-		ImageIO.write(img, "png", new File("build/panel_preview.png"));
 	}
 
 	@Test

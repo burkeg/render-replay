@@ -198,7 +198,7 @@ class RenderReplayPanel extends PluginPanel
 		export.setMargin(new Insets(2, 2, 2, 2));
 		importBtn.setMargin(new Insets(2, 2, 2, 2));
 		export.setToolTipText("Copy this slot to the clipboard");
-		importBtn.setToolTipText("Read a recording from the clipboard");
+		importBtn.setToolTipText("Load a recording from the clipboard, or pick a .rrec file");
 		export.addActionListener(e -> onExport.run());
 		importBtn.addActionListener(e -> onImport.run());
 		JPanel files = new JPanel(new GridBagLayout());

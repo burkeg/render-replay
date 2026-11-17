@@ -2,16 +2,22 @@ package com.renderreplay;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
+import java.nio.IntBuffer;
+import java.util.Arrays;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 
 /**
  * Delta codec for the client's 2D layer (interface + plugin overlays), one snapshot per frame.
- * A frame is stored as the pixels that changed since the previous frame, deflated: {len, n, (index, argb)*n}.
+ * A frame is stored as the runs of pixels that changed since the previous frame, deflated:
+ * {len, (start, count, argb * count)*}.
  */
 final class UiFrames
 {
+	// A run continues over this many unchanged pixels: storing them costs less than the header of a new run.
+	private static final int MAX_GAP = 2;
+
 	private UiFrames()
 	{
 	}
@@ -20,23 +26,38 @@ final class UiFrames
 	static byte[] encode(int[] prev, int[] cur)
 	{
 		boolean same = prev != null && prev.length == cur.length;
+		int len = cur.length;
+		int[] runs = new int[1024];
 		int n = 0;
-		for (int i = 0; i < cur.length; i++)
+		for (int i = 0; i < len; )
 		{
-			if (cur[i] != (same ? prev[i] : 0))
+			if (cur[i] == (same ? prev[i] : 0))
 			{
-				n++;
+				i++;
+				continue;
 			}
-		}
-		ByteBuffer b = ByteBuffer.allocate(8 + n * 8);
-		b.putInt(cur.length).putInt(n);
-		for (int i = 0; i < cur.length; i++)
-		{
-			if (cur[i] != (same ? prev[i] : 0))
+			int end = i + 1; // one past the last changed pixel of this run
+			for (int j = end; j < len && j - end <= MAX_GAP; j++)
 			{
-				b.putInt(i).putInt(cur[i]);
+				if (cur[j] != (same ? prev[j] : 0))
+				{
+					end = j + 1;
+				}
 			}
+			int count = end - i;
+			if (n + 2 + count > runs.length)
+			{
+				runs = Arrays.copyOf(runs, Math.max(runs.length * 2, n + 2 + count));
+			}
+			runs[n++] = i;
+			runs[n++] = count;
+			System.arraycopy(cur, i, runs, n, count);
+			n += count;
+			i = end;
 		}
+		ByteBuffer b = ByteBuffer.allocate(4 + n * 4);
+		b.putInt(len);
+		b.asIntBuffer().put(runs, 0, n);
 		Deflater d = new Deflater(Deflater.BEST_SPEED);
 		d.setInput(b.array());
 		d.finish();
@@ -59,15 +80,20 @@ final class UiFrames
 	/** Applies an encoded delta on top of target, which must already hold the previous frame. */
 	static void apply(byte[] enc, int[] target)
 	{
-		ByteBuffer b = ByteBuffer.wrap(inflate(enc, -1));
-		int len = b.getInt(), n = b.getInt();
+		IntBuffer b = ByteBuffer.wrap(inflate(enc, -1)).asIntBuffer();
+		int len = b.get();
 		if (len != target.length)
 		{
 			throw new IllegalArgumentException("buffer length " + target.length + " != frame length " + len);
 		}
-		for (int k = 0; k < n; k++)
+		while (b.remaining() >= 2)
 		{
-			target[b.getInt()] = b.getInt();
+			int start = b.get(), count = b.get();
+			if (start < 0 || count < 0 || count > len - start || count > b.remaining())
+			{
+				throw new IllegalArgumentException("bad run " + start + "+" + count);
+			}
+			b.get(target, start, count);
 		}
 	}
 
@@ -80,7 +106,7 @@ final class UiFrames
 	{
 		if (keyframe)
 		{
-			java.util.Arrays.fill(target, 0);
+			Arrays.fill(target, 0);
 		}
 		apply(enc, target);
 	}

@@ -47,6 +47,35 @@ public class UiFramesTest
 		assertTrue("identical frame should be tiny", enc[2].length < 64);
 	}
 
+	@Test
+	public void changedRunsAreStoredWithoutTheirSurroundings()
+	{
+		Random r = new Random(3);
+		int w = 400, h = 300;
+		int[] before = new int[w * h];
+		for (int i = 0; i < before.length; i++)
+		{
+			before[i] = r.nextInt();
+		}
+		int[] after = before.clone();
+		for (int y = 100; y < 140; y++)       // a 60 x 40 block is redrawn
+		{
+			for (int x = 50; x < 110; x++)
+			{
+				after[y * w + x] = r.nextInt();
+			}
+		}
+		after[5] ^= 1;                        // two pixels two apart: one run
+		after[8] ^= 1;
+		after[w * h - 1] ^= 1;                // the last pixel
+
+		byte[] enc = UiFrames.encode(before, after);
+		assertTrue("about 4 bytes per changed pixel, was " + enc.length, enc.length < 60 * 40 * 4 + 1200);
+		int[] rebuilt = before.clone();
+		UiFrames.apply(enc, rebuilt);
+		assertArrayEquals(after, rebuilt);
+	}
+
 	@Test(expected = IllegalArgumentException.class)
 	public void wrongSizedTargetIsRejected()
 	{

@@ -5,8 +5,8 @@ playback issues the recorded draw calls again, so the client re-renders the reco
 
 - **Record / Playback** from the side panel, into four slots. Needs the GPU plugin on.
 - **Timeline** to seek, pause and step one game tick. During playback Left and Right step a tick and Space pauses.
-- **Export / Import** a recording through the clipboard.
+- **Export / Import** a recording through the clipboard, or import a `.rrec` file.
 
 The plugin only reads client state and wraps the renderer; it sends nothing anywhere. A recording includes the
 interface and chat box as they looked, so treat an exported one like a screenshot. Files are kept in
-`.runelite/render-replay/`.
+`.runelite/plugin-data/render-replay/`.

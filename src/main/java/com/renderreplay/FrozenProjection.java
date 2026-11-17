@@ -1,5 +1,6 @@
 package com.renderreplay;
 
+import java.util.Arrays;
 import net.runelite.api.FloatProjection;
 
 /**
@@ -50,6 +51,18 @@ final class FrozenProjection implements FloatProjection
 		{
 			return p;
 		}
+	}
+
+	@Override
+	public boolean equals(Object o)
+	{
+		return o instanceof FrozenProjection && Arrays.equals(m, ((FrozenProjection) o).m);
+	}
+
+	@Override
+	public int hashCode()
+	{
+		return Arrays.hashCode(m);
 	}
 
 	@Override

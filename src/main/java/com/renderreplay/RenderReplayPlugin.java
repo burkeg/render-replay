@@ -15,14 +15,10 @@ import java.awt.image.BufferedImage;
 import java.io.BufferedWriter;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -53,7 +49,6 @@ import net.runelite.api.Player;
 import net.runelite.api.Scene;
 import net.runelite.api.events.BeforeRender;
 import net.runelite.api.hooks.DrawCallbacks;
-import net.runelite.client.RuneLite;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -62,6 +57,7 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.Filepath;
 
 /**
  * Records the game viewport's renderer input into one of four in-memory slots, and plays a slot back by issuing the
@@ -70,6 +66,7 @@ import net.runelite.client.ui.NavigationButton;
 @Slf4j
 @PluginDescriptor(
 	name = "Render Replay",
+	internalName = "render-replay",
 	description = "Record what the client sends to the GPU renderer and replay it in the game viewport",
 	tags = {"replay", "record", "gpu"}
 )
@@ -178,10 +175,12 @@ public class RenderReplayPlugin extends Plugin
 		}
 	};
 
-	private final Path dir = new File(RuneLite.RUNELITE_DIR, "render-replay").toPath();
-	// Working files of the recording in progress; Stop copies them into the slot's folder.
-	private final Path drawsFile = dir.resolve("recording.draws.jsonl");
-	private final Path modelsFile = dir.resolve("recording.models.jsonl");
+	// A recording's two files: the draw calls of every frame, and the geometry they refer to.
+	private static final String[] RECORDING_FILES = {"recording.draws.jsonl", "recording.models.jsonl"};
+
+	// The plugin's own directory. The working files of the recording in progress are written straight into it, and Stop
+	// copies them into the slot's folder.
+	private Filepath dir;
 
 	private final Slot[] slots = new Slot[SLOT_COUNT];
 	private volatile int selectedSlot;
@@ -203,10 +202,11 @@ public class RenderReplayPlugin extends Plugin
 	@Override
 	protected void startUp() throws IOException
 	{
-		Files.createDirectories(dir);
+		dir = getPluginDirectory();
+		dir.createDirectories();
 		panel = new RenderReplayPanel(this::toggleRecord, this::togglePlay, this::seek, this::togglePause, d -> step(d, false));
 		panel.setOnDragState(this::dragState);
-		panel.setSlotHandlers(this::selectSlot, this::exportSlot, this::importClipboard);
+		panel.setSlotHandlers(this::selectSlot, this::exportSlot, this::importRecording);
 		navButton = NavigationButton.builder().tooltip("Render Replay").icon(icon()).priority(9).panel(panel).build();
 		clientToolbar.addNavigation(navButton);
 		playbackKeys = new PlaybackKeys(this::togglePause, this::step);
@@ -434,9 +434,9 @@ public class RenderReplayPlugin extends Plugin
 
 	// ---- slots, export, import ----
 
-	private Path slotDir(int i)
+	private Filepath slotDir(int i)
 	{
-		return dir.resolve("slots").resolve("slot" + (i + 1));
+		return dir.join("slots", "slot" + (i + 1));
 	}
 
 	private String slotLabel(int i)
@@ -482,10 +482,12 @@ public class RenderReplayPlugin extends Plugin
 	{
 		try
 		{
-			Files.createDirectories(slotDir(i));
-			for (Path f : new Path[]{drawsFile, modelsFile})
+			slotDir(i).createDirectories();
+			for (String name : RECORDING_FILES)
 			{
-				Files.copy(f, slotDir(i).resolve(f.getFileName().toString()), StandardCopyOption.REPLACE_EXISTING);
+				Filepath kept = slotDir(i).joinSegment(name);
+				kept.deleteIfExists();
+				dir.joinSegment(name).copyTo(kept);
 			}
 		}
 		catch (IOException e)
@@ -520,13 +522,16 @@ public class RenderReplayPlugin extends Plugin
 			z.putNextEntry(new ZipEntry("frames.bin"));
 			DrawRecorder.exportFrames(sl.recorder, z);
 			z.closeEntry();
-			for (Path f : new Path[]{drawsFile, modelsFile})
+			for (String name : RECORDING_FILES)
 			{
-				Path kept = slotDir(i).resolve(f.getFileName().toString());
-				if (Files.exists(kept))
+				Filepath kept = slotDir(i).joinSegment(name);
+				if (kept.exists())
 				{
-					z.putNextEntry(new ZipEntry(f.getFileName().toString()));
-					Files.copy(kept, z);
+					z.putNextEntry(new ZipEntry(name));
+					try (InputStream in = kept.openInputStream())
+					{
+						in.transferTo(z);
+					}
 					z.closeEntry();
 				}
 			}
@@ -549,10 +554,10 @@ public class RenderReplayPlugin extends Plugin
 			{
 				ByteArrayOutputStream bos = new ByteArrayOutputStream();
 				writeZip(bos, i, sl);
-				Path exports = dir.resolve("exports");
-				Files.createDirectories(exports);
-				Path file = exports.resolve(String.format("slot%d-%tY%<tm%<td-%<tH%<tM%<tS.rrec", i + 1, new Date()));
-				Files.write(file, bos.toByteArray());
+				Filepath exports = dir.joinSegment("exports");
+				exports.createDirectories();
+				Filepath file = exports.joinSegment(String.format("slot%d-%tY%<tm%<td-%<tH%<tM%<tS.rrec", i + 1, new Date()));
+				file.write(bos.toByteArray());
 				String text;
 				String what;
 				if (bos.size() * 4L / 3 + CLIP_PREFIX.length() <= CLIP_MAX_BYTES)
@@ -562,9 +567,9 @@ public class RenderReplayPlugin extends Plugin
 				}
 				else
 				{
-					text = CLIP_FILE_PREFIX + file;
+					text = CLIP_FILE_PREFIX + file.getFileName();
 					what = "Slot " + (i + 1) + " is too big for the clipboard (" + (bos.size() >> 10) + " KB zipped). Saved "
-						+ file.getFileName() + " and copied its path: Import reads it back.";
+						+ file.getFileName() + " in the plugin's exports folder and copied its name: Import reads it back.";
 				}
 				Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
 				publish(what);
@@ -577,41 +582,82 @@ public class RenderReplayPlugin extends Plugin
 		});
 	}
 
-	/** Reads a recording from the clipboard (the data itself, or the path of a .rrec file) into the selected slot. */
-	private void importClipboard()
+	/** Import button: loads a recording into the selected slot. */
+	private void importRecording()
 	{
 		String text;
 		try
 		{
-			Object clip = Toolkit.getDefaultToolkit().getSystemClipboard().getData(DataFlavor.stringFlavor);
-			String raw = clip == null ? "" : clip.toString().trim();
-			byte[] zip;
-			if (raw.startsWith(CLIP_FILE_PREFIX))
+			final byte[] zip = importBytes();
+			if (zip == null)
 			{
-				Path f = Paths.get(raw.substring(CLIP_FILE_PREFIX.length()).trim());
-				if (!f.getFileName().toString().endsWith(".rrec"))
-				{
-					throw new IOException("not a .rrec file");
-				}
-				zip = Files.readAllBytes(f);
-			}
-			else if (raw.startsWith(CLIP_PREFIX))
-			{
-				zip = Base64.getDecoder().decode(raw.substring(CLIP_PREFIX.length()));
-			}
-			else
-			{
-				throw new IOException("the clipboard does not hold a Render Replay recording (copy one with Export first)");
+				return;
 			}
 			RecordingFile rf = RecordingFile.parse(zip);
 			text = describeImport(rf) + "\n\nLoading it into slot " + (selectedSlot + 1) + "… (press Playback when the panel says it is loaded)";
 			clientThread.invokeLater(() -> loadIntoSlot(rf, zip));
 		}
-		catch (IOException | RuntimeException | UnsupportedFlavorException ex)
+		catch (IOException | RuntimeException ex)
 		{
 			text = "Could not import: " + ex.getMessage();
 		}
 		JOptionPane.showMessageDialog(panel, text, "Render Replay import", JOptionPane.INFORMATION_MESSAGE);
+	}
+
+	/**
+	 * The recording to import: the one on the clipboard, the exported file the clipboard names, or else a .rrec file the
+	 * player picks. Null when they cancel.
+	 */
+	private byte[] importBytes() throws IOException
+	{
+		String raw = clipboardText();
+		if (raw.startsWith(CLIP_PREFIX))
+		{
+			return Base64.getDecoder().decode(raw.substring(CLIP_PREFIX.length()));
+		}
+		Filepath exports = dir.joinSegment("exports");
+		exports.createDirectories();
+		Filepath file;
+		if (raw.startsWith(CLIP_FILE_PREFIX))
+		{
+			file = exports.joinSegment(raw.substring(CLIP_FILE_PREFIX.length()).trim());
+		}
+		else
+		{
+			List<Filepath> picked = new Filepath.Chooser()
+				.setIsOpen()
+				.setAcceptsFiles()
+				.setDialogTitle("Import a Render Replay recording")
+				.addExtensionFilter("Render Replay recording (.rrec)", "rrec")
+				.setCurrentDirectory(exports)
+				.showDialog(panel);
+			if (picked == null || picked.isEmpty())
+			{
+				return null;
+			}
+			file = picked.get(0);
+		}
+		if (!file.getFileName().endsWith(".rrec"))
+		{
+			throw new IOException("not a .rrec file");
+		}
+		try (InputStream in = file.openInputStream())
+		{
+			return in.readAllBytes();
+		}
+	}
+
+	private static String clipboardText()
+	{
+		try
+		{
+			Object clip = Toolkit.getDefaultToolkit().getSystemClipboard().getData(DataFlavor.stringFlavor);
+			return clip == null ? "" : clip.toString().trim();
+		}
+		catch (IOException | RuntimeException | UnsupportedFlavorException e)
+		{
+			return "";
+		}
 	}
 
 	private static Map<String, String> settingsGroups(JsonObject manifest)
@@ -646,12 +692,11 @@ public class RenderReplayPlugin extends Plugin
 	{
 		try
 		{
-			Files.createDirectories(slotDir(i));
-			Set<String> names = new HashSet<>();
-			for (Path f : new Path[]{drawsFile, modelsFile})
+			slotDir(i).createDirectories();
+			Set<String> names = new HashSet<>(Arrays.asList(RECORDING_FILES));
+			for (String name : RECORDING_FILES)
 			{
-				names.add(f.getFileName().toString());
-				Files.deleteIfExists(slotDir(i).resolve(f.getFileName().toString()));
+				slotDir(i).joinSegment(name).deleteIfExists();
 			}
 			try (ZipInputStream z = new ZipInputStream(new ByteArrayInputStream(zip)))
 			{
@@ -659,7 +704,10 @@ public class RenderReplayPlugin extends Plugin
 				{
 					if (names.contains(e.getName()))
 					{
-						Files.copy(z, slotDir(i).resolve(e.getName()), StandardCopyOption.REPLACE_EXISTING);
+						try (OutputStream out = slotDir(i).joinSegment(e.getName()).openOutputStream())
+						{
+							z.transferTo(out);
+						}
 					}
 				}
 			}
@@ -737,8 +785,8 @@ public class RenderReplayPlugin extends Plugin
 		}
 		try
 		{
-			drawOut = Files.newBufferedWriter(drawsFile, StandardCharsets.UTF_8);
-			modelsOut = Files.newBufferedWriter(modelsFile, StandardCharsets.UTF_8);
+			drawOut = dir.joinSegment(RECORDING_FILES[0]).openBufferedWriter();
+			modelsOut = dir.joinSegment(RECORDING_FILES[1]).openBufferedWriter();
 		}
 		catch (IOException e)
 		{

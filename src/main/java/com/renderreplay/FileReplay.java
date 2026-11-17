@@ -94,29 +94,29 @@ final class FileReplay
 
 	// ---- stand-ins ----
 
-	/** From a models.jsonl "model" entry. */
-	static Model model(JsonObject b)
+	/** From a models.jsonl "model" entry. Equal arrays are shared through the pool. */
+	static Model model(JsonObject b, ArrayPool pool)
 	{
 		StandIns.StandInModel m = new StandIns.StandInModel();
 		m.vn = intOr(b, "vn", 0);
 		m.fn = intOr(b, "fn", 0);
-		m.vx = floats(b, "vx");
-		m.vy = floats(b, "vy");
-		m.vz = floats(b, "vz");
-		m.f1 = ints(b, "f1");
-		m.f2 = ints(b, "f2");
-		m.f3 = ints(b, "f3");
-		m.c1 = ints(b, "c1");
-		m.c2 = ints(b, "c2");
-		m.c3 = ints(b, "c3");
-		m.tr = bytes(b, "tr");
-		m.pri = bytes(b, "pri");
-		m.ft = shorts(b, "ft");
-		m.fb = bytes(b, "fb");
-		m.tf = bytes(b, "tf");
-		m.t1 = ints(b, "t1");
-		m.t2 = ints(b, "t2");
-		m.t3 = ints(b, "t3");
+		m.vx = pool.share(floats(b, "vx"));
+		m.vy = pool.share(floats(b, "vy"));
+		m.vz = pool.share(floats(b, "vz"));
+		m.f1 = pool.share(ints(b, "f1"));
+		m.f2 = pool.share(ints(b, "f2"));
+		m.f3 = pool.share(ints(b, "f3"));
+		m.c1 = pool.share(ints(b, "c1"));
+		m.c2 = pool.share(ints(b, "c2"));
+		m.c3 = pool.share(ints(b, "c3"));
+		m.tr = pool.share(bytes(b, "tr"));
+		m.pri = pool.share(bytes(b, "pri"));
+		m.ft = pool.share(shorts(b, "ft"));
+		m.fb = pool.share(bytes(b, "fb"));
+		m.tf = pool.share(bytes(b, "tf"));
+		m.t1 = pool.share(ints(b, "t1"));
+		m.t2 = pool.share(ints(b, "t2"));
+		m.t3 = pool.share(ints(b, "t3"));
 		int[] ov = ints(b, "ov");
 		if (ov != null && ov.length == 4)
 		{
@@ -132,33 +132,34 @@ final class FileReplay
 
 	/**
 	 * A frozen copy of a live model, holding the same fields a models.jsonl "model" entry carries. The client reuses and
-	 * rewrites its Model objects, so playback draws these copies instead. Arrays are copied, never shared.
+	 * rewrites its Model objects, so playback draws these copies instead. Arrays are copied, never shared with the live
+	 * model; equal arrays of different copies are shared through the pool.
 	 */
-	static Model copyOf(Model src)
+	static Model copyOf(Model src, ArrayPool pool)
 	{
 		StandIns.StandInModel m = new StandIns.StandInModel();
 		m.vn = src.getVerticesCount();
 		m.fn = src.getFaceCount();
-		m.vx = copy(src.getVerticesX(), m.vn);
-		m.vy = copy(src.getVerticesY(), m.vn);
-		m.vz = copy(src.getVerticesZ(), m.vn);
-		m.f1 = copy(src.getFaceIndices1(), m.fn);
-		m.f2 = copy(src.getFaceIndices2(), m.fn);
-		m.f3 = copy(src.getFaceIndices3(), m.fn);
-		m.c1 = copy(src.getFaceColors1(), m.fn);
-		m.c2 = copy(src.getFaceColors2(), m.fn);
-		m.c3 = copy(src.getFaceColors3(), m.fn);
-		m.tr = copy(src.getFaceTransparencies(), m.fn);
-		m.pri = copy(src.getFaceRenderPriorities(), m.fn);
-		m.ft = copy(src.getFaceTextures(), m.fn);
-		m.fb = copy(src.getFaceBias(), m.fn);
+		m.vx = pool.share(copy(src.getVerticesX(), m.vn));
+		m.vy = pool.share(copy(src.getVerticesY(), m.vn));
+		m.vz = pool.share(copy(src.getVerticesZ(), m.vn));
+		m.f1 = pool.share(copy(src.getFaceIndices1(), m.fn));
+		m.f2 = pool.share(copy(src.getFaceIndices2(), m.fn));
+		m.f3 = pool.share(copy(src.getFaceIndices3(), m.fn));
+		m.c1 = pool.share(copy(src.getFaceColors1(), m.fn));
+		m.c2 = pool.share(copy(src.getFaceColors2(), m.fn));
+		m.c3 = pool.share(copy(src.getFaceColors3(), m.fn));
+		m.tr = pool.share(copy(src.getFaceTransparencies(), m.fn));
+		m.pri = pool.share(copy(src.getFaceRenderPriorities(), m.fn));
+		m.ft = pool.share(copy(src.getFaceTextures(), m.fn));
+		m.fb = pool.share(copy(src.getFaceBias(), m.fn));
 		// the texture arrays are indexed by texture face, not by face: keep their full length
 		byte[] tf = src.getTextureFaces();
-		m.tf = tf == null ? null : tf.clone();
+		m.tf = pool.share(tf == null ? null : tf.clone());
 		int[] t1 = src.getTexIndices1(), t2 = src.getTexIndices2(), t3 = src.getTexIndices3();
-		m.t1 = t1 == null ? null : t1.clone();
-		m.t2 = t2 == null ? null : t2.clone();
-		m.t3 = t3 == null ? null : t3.clone();
+		m.t1 = pool.share(t1 == null ? null : t1.clone());
+		m.t2 = pool.share(t2 == null ? null : t2.clone());
+		m.t3 = pool.share(t3 == null ? null : t3.clone());
 		m.ov0 = src.getOverrideAmount();
 		m.ov1 = src.getOverrideHue();
 		m.ov2 = src.getOverrideSaturation();

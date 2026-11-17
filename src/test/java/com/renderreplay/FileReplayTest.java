@@ -4,6 +4,7 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import com.google.gson.JsonObject;
@@ -25,7 +26,7 @@ public class FileReplayTest
 	{
 		Model m = FileReplay.model(json("{\"id\":5,\"kind\":\"model\",\"vn\":3,\"fn\":1,\"vx\":[1.5,2,3],\"vy\":[0,0,0],\"vz\":[4,5,6],"
 			+ "\"f1\":[0],\"f2\":[1],\"f3\":[2],\"c1\":[100],\"c2\":[101],\"c3\":[102],\"tr\":[0],\"pri\":[3],\"ft\":[-1],\"fb\":[7],"
-			+ "\"ov\":[1,2,3,4],\"tp\":9,\"tf\":[1],\"t1\":[0],\"t2\":[1],\"t3\":[2],\"rad\":50,\"dia\":100}"));
+			+ "\"ov\":[1,2,3,4],\"tp\":9,\"tf\":[1],\"t1\":[0],\"t2\":[1],\"t3\":[2],\"rad\":50,\"dia\":100}"), new ArrayPool());
 		assertEquals(3, m.getVerticesCount());
 		assertEquals(1, m.getFaceCount());
 		assertArrayEquals(new float[]{1.5f, 2, 3}, m.getVerticesX(), 0);
@@ -68,7 +69,7 @@ public class FileReplayTest
 		live.rad = 50;
 		live.dia = 100;
 
-		Model copy = FileReplay.copyOf(live);
+		Model copy = FileReplay.copyOf(live, new ArrayPool());
 		assertEquals(2, copy.getVerticesCount());
 		assertEquals(1, copy.getFaceCount());
 		assertArrayEquals(new float[]{1, 2}, copy.getVerticesX(), 0);
@@ -91,6 +92,31 @@ public class FileReplayTest
 		assertArrayEquals(new int[]{100}, copy.getFaceColors1());
 		assertArrayEquals(new float[]{1, 2}, copy.getVerticesX(), 0);
 		assertArrayEquals(new byte[]{1, 2, 3}, copy.getTextureFaces());
+	}
+
+	@Test
+	public void copiesOfAnAnimatedModelShareWhatDoesNotChange()
+	{
+		StandIns.StandInModel live = new StandIns.StandInModel();
+		live.vn = 2;
+		live.fn = 1;
+		live.vx = new float[]{1, 2};
+		live.vy = new float[]{3, 4};
+		live.vz = new float[]{5, 6};
+		live.f1 = new int[]{0};
+		live.c1 = new int[]{100};
+		live.pri = new byte[]{3};
+		ArrayPool pool = new ArrayPool();
+		Model first = FileReplay.copyOf(live, pool);
+		live.vy[1] = 9;                              // the next pose moves a vertex
+		Model second = FileReplay.copyOf(live, pool);
+
+		assertSame(first.getFaceIndices1(), second.getFaceIndices1());
+		assertSame(first.getFaceColors1(), second.getFaceColors1());
+		assertSame(first.getFaceRenderPriorities(), second.getFaceRenderPriorities());
+		assertSame(first.getVerticesX(), second.getVerticesX());
+		assertArrayEquals(new float[]{3, 4}, first.getVerticesY(), 0);
+		assertArrayEquals(new float[]{3, 9}, second.getVerticesY(), 0);
 	}
 
 	@Test
