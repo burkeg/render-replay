@@ -40,10 +40,65 @@ class RenderReplayPanel extends PluginPanel
 	private volatile Runnable onExport = () -> { };
 	private volatile Runnable onImport = () -> { };
 	private final JLabel status = new JLabel("Idle");
+	// Recording quality: one stop per Pareto-optimal preset, with the projected max recording time beside it.
+	private final JSlider quality = new JSlider(0, Presets.ALL.length - 1, 0);
+	private final JLabel projected = new JLabel("-", SwingConstants.CENTER);
+	private final JLabel qualityName = new JLabel("", SwingConstants.LEFT);
+	private java.util.function.IntConsumer onQuality = i -> {};
+	private boolean qualityProgrammatic;
+	// While a stopped recording is saved, a progress bar takes the Record button's place (the layout does not move).
+	private final JPanel recordRow = new JPanel(new java.awt.CardLayout());
+	private final javax.swing.JProgressBar saving = new javax.swing.JProgressBar(0, 1000);
+	private javax.swing.Timer savingTimer;
+	// While recording: the button's text and tooltip when it is not plain "Stop recording" (memory full: Save)
+	private String stopLabel, stopTip;
+	private RenderReplayPlugin.State shownState = RenderReplayPlugin.State.IDLE;
 	private final JLabel hint = new JLabel("<html>Playing: Left/Right = 1 tick, Space = pause</html>");
 	private int lastDragTick = -1;
 	private boolean dragging;
 	private volatile java.util.function.Consumer<Boolean> onDragState = b -> { };
+
+	void setOnQuality(java.util.function.IntConsumer c)
+	{
+		onQuality = c;
+	}
+
+	/** Shows preset i as chosen, without telling the plugin. */
+	void setQuality(int i)
+	{
+		qualityProgrammatic = true;
+		quality.setValue(i);
+		qualityProgrammatic = false;
+		describeQuality(i);
+	}
+
+	/** The projected max recording time for the chosen preset, and how it was worked out. */
+	void setProjected(String text, String how)
+	{
+		SwingUtilities.invokeLater(() ->
+		{
+			projected.setText(text);
+			projected.setToolTipText(how);
+		});
+	}
+
+	/** Memory per frame against lossless, in dB: 0 is lossless, every -10 dB keeps 10 times less. */
+	static double compressionDb(Presets.Preset p)
+	{
+		return 10 * Math.log10(p.labBytesPerFrame / (double) Presets.ALL[0].labBytesPerFrame);
+	}
+
+	private void describeQuality(int i)
+	{
+		Presets.Preset p = Presets.ALL[i];
+		double db = compressionDb(p);
+		String q = i == 0 ? "0 dB, lossless" : String.format("%.1f dB", db);
+		qualityName.setText("<html>Quality " + (i + 1) + " of " + Presets.ALL.length + ": " + q + "</html>");
+		qualityName.setToolTipText("<html>" + p.name + "<br>Memory per frame against lossless: 0 dB keeps everything, "
+			+ "every -10 dB keeps 10 times less" + (i == 0 ? "." : String.format(" (this one about %.0f times less).", Math.pow(10, -db / 10)))
+			+ "<br>Applies to the next recording.</html>");
+		quality.setToolTipText(qualityName.getToolTipText());
+	}
 
 	void setSlotHandlers(java.util.function.IntConsumer select, Runnable exportAction, Runnable importAction)
 	{
@@ -213,7 +268,35 @@ class RenderReplayPanel extends PluginPanel
 		fc.gridx = 1;
 		fc.insets = new Insets(0, 0, 0, 0);
 		files.add(fixed(importBtn, 28), fc);
-		for (Object[] r : new Object[][]{{slots, 28}, {files, 28}, {record, 32}, {play, 32}, {transport, 32}, {timeline, 26}, {time, 34}, {status, 78}, {hint, 30}})
+		quality.setSnapToTicks(true);
+		quality.setMajorTickSpacing(1);
+		quality.setPaintTicks(true);
+		quality.setFocusable(false);
+		quality.addChangeListener(e ->
+		{
+			describeQuality(quality.getValue());
+			if (!qualityProgrammatic)
+			{
+				onQuality.accept(quality.getValue());
+			}
+		});
+		projected.setOpaque(true);
+		projected.setBorder(javax.swing.BorderFactory.createLineBorder(Color.GRAY));
+		projected.setPreferredSize(new Dimension(62, 26));
+		projected.setFont(projected.getFont().deriveFont(java.awt.Font.BOLD));
+		qualityName.setForeground(Color.GRAY);
+		qualityName.setFont(qualityName.getFont().deriveFont(qualityName.getFont().getSize2D() - 1f));
+		JPanel qualityRow = new JPanel(new java.awt.BorderLayout(6, 0));
+		qualityRow.setOpaque(false);
+		qualityRow.add(quality, java.awt.BorderLayout.CENTER);
+		qualityRow.add(projected, java.awt.BorderLayout.EAST);
+		describeQuality(0);
+		saving.setStringPainted(true);
+		saving.setString("Saving…");
+		recordRow.setOpaque(false);
+		recordRow.add(record, "button");
+		recordRow.add(saving, "saving");
+		for (Object[] r : new Object[][]{{slots, 28}, {files, 28}, {qualityRow, 30}, {qualityName, 18}, {recordRow, 32}, {play, 32}, {transport, 32}, {timeline, 26}, {time, 34}, {status, 78}, {hint, 30}})
 		{
 			c.gridy = row++;
 			add(fixed((JComponent) r[0], (Integer) r[1]), c);
@@ -233,11 +316,64 @@ class RenderReplayPanel extends PluginPanel
 		return comp;
 	}
 
+	/** Shows the saving bar in place of the Record button, following progress (0..1, or -1 when done) until update() leaves SAVING. */
+	void showSaving(java.util.function.DoubleSupplier progress)
+	{
+		SwingUtilities.invokeLater(() ->
+		{
+			if (savingTimer != null)
+			{
+				savingTimer.stop();
+			}
+			saving.setValue(0);
+			saving.setString("Saving…");
+			((java.awt.CardLayout) recordRow.getLayout()).show(recordRow, "saving");
+			savingTimer = new javax.swing.Timer(100, e ->
+			{
+				double p = progress.getAsDouble();
+				if (p < 0)
+				{
+					return;
+				}
+				saving.setValue((int) Math.round(p * 1000));
+				saving.setString(p >= 1 ? "Saving files…" : String.format("Saving… %d%%", (int) (p * 100)));
+			});
+			savingTimer.start();
+		});
+	}
+
+	/** While recording, what the Record button says (null for "Stop recording"), with its tooltip. */
+	void setStopLabel(String text, String tip)
+	{
+		SwingUtilities.invokeLater(() ->
+		{
+			stopLabel = text;
+			stopTip = tip;
+			if (shownState == RenderReplayPlugin.State.RECORDING)
+			{
+				record.setText(text != null ? text : "Stop recording");
+				record.setToolTipText(tip);
+			}
+		});
+	}
+
 	void update(RenderReplayPlugin.State state, boolean hasRecording, String message)
 	{
 		SwingUtilities.invokeLater(() ->
 		{
-			record.setText(state == RenderReplayPlugin.State.RECORDING ? "Stop recording" : "Record");
+			shownState = state;
+			if (state != RenderReplayPlugin.State.SAVING)
+			{
+				if (savingTimer != null)
+				{
+					savingTimer.stop();
+					savingTimer = null;
+				}
+				((java.awt.CardLayout) recordRow.getLayout()).show(recordRow, "button");
+			}
+			boolean rec = state == RenderReplayPlugin.State.RECORDING;
+			record.setText(rec ? (stopLabel != null ? stopLabel : "Stop recording") : "Record");
+			record.setToolTipText(rec ? stopTip : null);
 			record.setEnabled(state != RenderReplayPlugin.State.PLAYING);
 			play.setText(state == RenderReplayPlugin.State.PLAYING ? "Stop playback" : "Playback");
 			play.setEnabled(state == RenderReplayPlugin.State.PLAYING

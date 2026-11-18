@@ -58,6 +58,8 @@ import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.util.Filepath;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.widgets.Widget;
 
 /**
  * Records the game viewport's renderer input into one of four in-memory slots, and plays a slot back by issuing the
@@ -74,7 +76,7 @@ public class RenderReplayPlugin extends Plugin
 {
 	enum State
 	{
-		IDLE, RECORDING, PLAYING
+		IDLE, RECORDING, SAVING, PLAYING
 	}
 
 	static final int SLOT_COUNT = 4;
@@ -125,6 +127,31 @@ public class RenderReplayPlugin extends Plugin
 		{
 			BufferProvider bp = client.getBufferProvider();
 			return bp == null ? null : bp.getPixels();
+		}
+
+		@Override
+		public int uiWidth()
+		{
+			BufferProvider bp = client.getBufferProvider();
+			return bp == null ? 0 : bp.getWidth();
+		}
+
+		@Override
+		public int[] minimap()
+		{
+			for (int id : MINIMAP_WIDGETS)
+			{
+				Widget w = client.getWidget(id);
+				if (w != null && !w.isHidden())
+				{
+					java.awt.Rectangle b = w.getBounds();
+					if (b != null && b.width > 20 && b.height > 20)
+					{
+						return new int[]{b.x + b.width / 2, b.y + b.height / 2, Math.min(b.width, b.height) / 2};
+					}
+				}
+			}
+			return null;
 		}
 
 		@Override
@@ -207,6 +234,11 @@ public class RenderReplayPlugin extends Plugin
 		panel = new RenderReplayPanel(this::toggleRecord, this::togglePlay, this::seek, this::togglePause, d -> step(d, false));
 		panel.setOnDragState(this::dragState);
 		panel.setSlotHandlers(this::selectSlot, this::exportSlot, this::importRecording);
+		int q = savedQuality();
+		DrawRecorder.preset = Presets.ALL[q];
+		panel.setQuality(q);
+		panel.setOnQuality(this::chooseQuality);
+		refreshProjection();
 		navButton = NavigationButton.builder().tooltip("Render Replay").icon(icon()).priority(9).panel(panel).build();
 		clientToolbar.addNavigation(navButton);
 		playbackKeys = new PlaybackKeys(this::togglePause, this::step);
@@ -223,7 +255,7 @@ public class RenderReplayPlugin extends Plugin
 		clientToolbar.removeNavigation(navButton);
 		clientThread.invoke(() ->
 		{
-			stopRecording();
+			stopRecordingNow();
 			stopPlayback();
 			Arrays.fill(slots, null);
 			recording = null;
@@ -447,8 +479,14 @@ public class RenderReplayPlugin extends Plugin
 			return "Slot " + (i + 1) + " · empty";
 		}
 		long[] tl = DrawRecorder.timeline(sl.recorder);
-		double ticks = tl == null ? 0 : tl[1] / 600.0;
-		return String.format(Locale.ROOT, "Slot %d · %.1f ticks · %tR", i + 1, ticks, new Date(sl.createdMs));
+		double secs = tl == null ? 0 : tl[1] / 1000.0;
+		String length = secs < 60 ? String.format(Locale.ROOT, "%.1f s", secs) : clock((long) (secs * 1000));
+		return "Slot " + (i + 1) + " · " + length + " · " + size(DrawRecorder.retainedBytes(sl.recorder));
+	}
+
+	private static String size(long bytes)
+	{
+		return bytes < 1 << 20 ? Math.max(1, bytes >> 10) + " KB" : String.format(Locale.ROOT, "%.1f MB", bytes / (double) (1 << 20));
 	}
 
 	private void refreshSlots()
@@ -487,7 +525,13 @@ public class RenderReplayPlugin extends Plugin
 			{
 				Filepath kept = slotDir(i).joinSegment(name);
 				kept.deleteIfExists();
-				dir.joinSegment(name).copyTo(kept);
+				// the files are closed and the next recording starts new ones: moving is a rename, where a copy of
+				// hundreds of MB took seconds
+				Filepath made = dir.joinSegment(name);
+				if (made.exists())
+				{
+					made.moveTo(kept);
+				}
 			}
 		}
 		catch (IOException e)
@@ -828,11 +872,86 @@ public class RenderReplayPlugin extends Plugin
 			log.warn("could not copy the current scene", e);
 		}
 		state = State.RECORDING;
+		fullNoticed = false;
+		panel.setStopLabel(null, null);
 		ensureWrapped();
 		publish("Recording…");
 	}
 
+	/**
+	 * Stop pressed: capturing ends at once and the game keeps drawing, while the writer thread codes the frames still
+	 * queued and saves the files. The panel shows a saving bar until it is done; Record and Playback wait for it.
+	 */
 	private void stopRecording()
+	{
+		if (state != State.RECORDING)
+		{
+			return;
+		}
+		DrawCallbacks rec = recording;
+		if (rec == null)
+		{
+			stopRecordingNow();
+			return;
+		}
+		state = State.SAVING;
+		final int slot = selectedSlot;
+		long fullAt = DrawRecorder.fullSince(rec);
+		final String lost = fullAt < 0 ? "" : "; " + clock(System.currentTimeMillis() - fullAt) + " after memory filled was not recorded";
+		final BufferedWriter draws = drawOut, models = modelsOut;
+		Runnable done = () ->
+		{
+			// writer thread, after every queued frame
+			try
+			{
+				closeQuietly(draws);
+				closeQuietly(models);
+				saveSlotFiles(slot);
+			}
+			finally
+			{
+				clientThread.invokeLater(() ->
+				{
+					if (state == State.SAVING)
+					{
+						state = State.IDLE;
+					}
+					publish("Saved " + DrawRecorder.retainedFrames(rec) + " frames in slot " + (slot + 1) + lost);
+				});
+			}
+		};
+		boolean queued = DrawRecorder.finishCapture(rec, done);
+		DrawCallbacks cur = client.getDrawCallbacks();
+		if (DrawRecorder.isWrapped(cur))
+		{
+			client.setDrawCallbacks(DrawRecorder.unwrap(cur));
+		}
+		if (!queued)
+		{
+			// the writer's queue is full: hand it the save step as soon as there is room, behind every frame
+			clientThread.invokeLater(() -> DrawRecorder.finishCapture(rec, done));
+		}
+		panel.showSaving(() -> DrawRecorder.savingProgress(rec));
+		publish("Saving…");
+	}
+
+	private static void closeQuietly(BufferedWriter w)
+	{
+		try
+		{
+			if (w != null)
+			{
+				w.close();
+			}
+		}
+		catch (IOException e)
+		{
+			log.warn("close failed", e);
+		}
+	}
+
+	/** Stops and saves before returning (plugin shutdown). */
+	private void stopRecordingNow()
 	{
 		if (state != State.RECORDING)
 		{
@@ -889,6 +1008,124 @@ public class RenderReplayPlugin extends Plugin
 		client.setDrawCallbacks(recording);
 	}
 
+	// ---- recording quality ----
+
+	private static final String CONFIG_GROUP = "renderreplay";
+	// The minimap in the fixed, resizable and resizable-modern layouts.
+	private static final int[] MINIMAP_WIDGETS = {InterfaceID.ToplevelOsrsStretch.MINIMAP, InterfaceID.ToplevelPreEoc.MINIMAP,
+		InterfaceID.Toplevel.MINIMAP};
+
+	private int savedQuality()
+	{
+		try
+		{
+			String v = configManager.getConfiguration(CONFIG_GROUP, "quality");
+			int i = v == null ? 0 : Integer.parseInt(v);
+			return Math.max(0, Math.min(Presets.ALL.length - 1, i));
+		}
+		catch (NumberFormatException e)
+		{
+			return 0;
+		}
+	}
+
+	private void chooseQuality(int i)
+	{
+		configManager.setConfiguration(CONFIG_GROUP, "quality", i);
+		DrawRecorder.preset = Presets.ALL[i];
+		refreshProjection();
+	}
+
+	/**
+	 * The box beside the quality slider. While recording: the time left before this slot's memory is full, from the
+	 * rate the recording grows at (after that the oldest frames are dropped as it goes). Otherwise: the max recording
+	 * time at the chosen quality, from the steady rate of this slot's recording when it has run long enough (scaled to
+	 * the chosen quality), else from the sample the presets were measured on.
+	 */
+	private void refreshProjection()
+	{
+		Presets.Preset p = DrawRecorder.preset;
+		DrawCallbacks rec = recording;
+		if (state == State.RECORDING && rec != null)
+		{
+			long budget = DrawRecorder.budgetBytes, used = DrawRecorder.retainedBytes(rec);
+			long fullAt = DrawRecorder.fullSince(rec);
+			if (fullAt >= 0)
+			{
+				// recording stopped at the limit; saving waits for the user, who sees how much play went unrecorded
+				long[] tl = DrawRecorder.timeline(rec);
+				String held = tl == null ? "what was recorded" : "the " + duration(tl[1] / 1000.0) + " recorded";
+				panel.setProjected("Full", "<html>Recording stopped when the " + (budget >> 20) + " MB this slot can use was full.<br>"
+					+ "It holds " + held + ".</html>");
+				panel.setStopLabel("Save · " + clock(System.currentTimeMillis() - fullAt) + " lost (memory full)",
+					"<html>Recording stopped when this slot's memory was full; the time since then was not recorded.<br>"
+						+ "Press to save " + held + ".</html>");
+				if (!fullNoticed)
+				{
+					fullNoticed = true;
+					publish("Memory full: recording stopped. Press Save to keep it.");
+				}
+				return;
+			}
+			panel.setStopLabel(null, null);
+			Presets.Preset rp = DrawRecorder.preset(rec) != null ? DrawRecorder.preset(rec) : p;
+			double rate = DrawRecorder.steadyRate(rec);
+			double perSec = rate > 0 ? rate : rp.labBytesPerFrame * 55.0;
+			String how = rate > 0 ? "Measured on this recording." : "Estimated from a sample recording until this one has run 10 seconds.";
+			panel.setProjected(duration((budget - used) / Math.max(1.0, perSec)), "<html>Recording time left before the "
+				+ (budget >> 20) + " MB this slot can use is full.<br>After that the oldest frames are dropped as you record.<br>"
+				+ how + "</html>");
+			return;
+		}
+		long others = 0;
+		for (int i = 0; i < SLOT_COUNT; i++)
+		{
+			if (i != selectedSlot && slots[i] != null)
+			{
+				others += DrawRecorder.retainedBytes(slots[i].recorder);
+			}
+		}
+		long budget = Math.max(TOTAL_BUDGET / SLOT_COUNT, TOTAL_BUDGET - others);
+		Presets.Preset measured = rec == null ? null : DrawRecorder.preset(rec);
+		double rate = rec == null ? 0 : DrawRecorder.steadyRate(rec);
+		double perSec;
+		String how;
+		if (rate > 0 && measured != null)
+		{
+			perSec = rate * p.labBytesPerFrame / Math.max(1.0, measured.labBytesPerFrame);
+			how = measured == p ? "Measured on this slot's recording." : "Scaled from this slot's recording, made at another quality.";
+		}
+		else
+		{
+			perSec = p.labBytesPerFrame * 55.0;
+			how = "Estimated from a sample recording. Record for 20 seconds to measure yours.";
+		}
+		panel.setProjected(duration(budget / Math.max(1.0, perSec)), "<html>Max recording time with the " + (budget >> 20)
+			+ " MB this slot can use.<br>" + how + "</html>");
+	}
+
+	private boolean fullNoticed;
+
+	/** Elapsed time as m:ss, or h:mm:ss from an hour. */
+	private static String clock(long ms)
+	{
+		long s = Math.max(0, ms / 1000);
+		return s >= 3600 ? String.format("%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60) : String.format("%d:%02d", s / 60, s % 60);
+	}
+
+	private static String duration(double secs)
+	{
+		if (secs < 60)
+		{
+			return Math.max(0, (int) secs) + " s";
+		}
+		if (secs < 7200)
+		{
+			return (int) (secs / 60) + " min";
+		}
+		return String.format("%.1f h", secs / 3600);
+	}
+
 	// ---- panel ----
 
 	private void publish(String msg)
@@ -902,8 +1139,9 @@ public class RenderReplayPlugin extends Plugin
 	/** Client thread, on every state change and once a second: the timeline, and what is off about a running playback. */
 	private void refreshPlayback()
 	{
+		refreshProjection();
 		DrawCallbacks rec = recording;
-		if (rec == null || state == State.RECORDING)
+		if (rec == null || state == State.RECORDING || state == State.SAVING)
 		{
 			return;
 		}

@@ -18,6 +18,12 @@ final class FrozenProjection implements FloatProjection
 		this.m = m;
 	}
 
+	/** A projection from a recorded column-major 4x4 matrix (as DrawRecorder.describe records a FloatProjection). */
+	static FrozenProjection ofMatrix(float[] m)
+	{
+		return m == null || m.length != 16 ? null : new FrozenProjection(m.clone());
+	}
+
 	/**
 	 * A frozen copy of p, or p itself when its project() is not the affine map of its matrix (then copying would change what the
 	 * renderer computes). Checked on four points, the same ones DrawRecorder.describe records.

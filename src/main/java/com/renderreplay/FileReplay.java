@@ -243,6 +243,21 @@ final class FileReplay
 	}
 
 	/** From a {"proj":..,"s":[[o],[x128],[y128],[z128]]} cell: an affine map rebuilt from four sample points. */
+	/**
+	 * Stands for the camera projection in rebuilt frames. The four points the recorder samples give the renderer wrong
+	 * depths for this projection, so playback hands the renderer the client's own camera projection instead, and this
+	 * rebuilt one only until it has seen one.
+	 */
+	static final class LiveProjection
+	{
+		final Projection fallback;
+
+		LiveProjection(Projection fallback)
+		{
+			this.fallback = fallback;
+		}
+	}
+
 	static Projection projection(JsonObject o)
 	{
 		JsonArray s = o.getAsJsonArray("s");
